@@ -1,6 +1,4 @@
 #include "AddressHashCollection.hpp"
-#include "SerialSecretGenerator.hpp"
-#include "RandSecretGenerator.hpp"
 
 #include <secp256k1.h>
 #include <bitcoin/bitcoin.hpp>
@@ -10,7 +8,6 @@
 #include <boost/filesystem.hpp>
 #include <boost/range/counting_range.hpp>
 #include <boost/regex.hpp>
-#include <boost/thread.hpp>
 #include <tclap/CmdLine.h>
 #include <algorithm>
 #include <chrono>
@@ -25,8 +22,8 @@ static const boost::regex CommentPattern("^\\s*|\\s*$");
 
 typedef std::function<bool(bc::ec_secret&)> GetSecretFn;
 
-typedef boost::mutex lock_type;
-typedef lock_type::scoped_lock guard_type;
+typedef std::mutex lock_type;
+typedef std::unique_lock<lock_type> guard_type;
 
 static inline void get_short_hash(bc::ec_point const& ecp,
 	bc::hash_digest& sha, bc::short_hash& rmd,
@@ -122,10 +119,14 @@ static unsigned MaxThreadCount()
 
 int main(int argc, char* argv[])
 {
+	secp256k1_start(SECP256K1_START_VERIFY | SECP256K1_START_SIGN);
+
 	TCLAP::CmdLine cmd("BBF", ' ', "0.1");
-	TCLAP::UnlabeledValueArg<std::string> hashFileArg("hashFile",
-		"File containing base-16 hash strings", true, std::string(), "string", cmd);
-	TCLAP::ValueArg<unsigned> threadCountArg("j", "threadCount",
+	TCLAP::UnlabeledValueArg<std::string> keyFileArg("keyfile",
+		"File containing base-16 keys", false, "-", "string", cmd);
+	TCLAP::ValueArg<std::string> hashFileArg("a", "hashfile",
+		"File containing base-16 address hashes", true, std::string(), "string", cmd);
+	TCLAP::ValueArg<unsigned> threadCountArg("j", "threads",
 		"Number of threads to use", false, DefaultThreadCount(), "int", cmd);
 	try
 	{
@@ -137,37 +138,60 @@ int main(int argc, char* argv[])
 		return 1;
 	}
 
-	auto const& fileName = hashFileArg.getValue();
+	auto const& hashFileName = hashFileArg.getValue();
+	auto const& keyFileName = keyFileArg.getValue();
 	auto const threadCount = std::max(1U, std::min(MaxThreadCount(), threadCountArg.getValue()));
 
-	std::ifstream file;
-	std::istream* inputStreamPtr;
-	uint64_t estimatedSize;
-	if (fileName == "-")
+	if (hashFileName == keyFileName)
 	{
-		inputStreamPtr = &std::cin;
+		std::cerr << "Error: Address hash and key sources match" << std::endl;
+		return 1;
+	}
+
+	std::ifstream hashFile;
+	std::istream* hashStreamPtr;
+	uint64_t estimatedSize;
+	if (hashFileName == "-")
+	{
+		hashStreamPtr = &std::cin;
 		estimatedSize = 100 * 1024;
 	}
 	else
 	{
-		file.open(fileName);
-		if (!file.is_open())
+		hashFile.open(hashFileName);
+		if (!hashFile.is_open())
 		{
-			std::cerr << "Error: Failed to open " << fileName << std::endl;
+			std::cerr << "Error: Failed to open " << hashFileName << std::endl;
 			return 1;
 		}
-		inputStreamPtr = &file;
-		estimatedSize = bfs::file_size(fileName);
+		hashStreamPtr = &hashFile;
+		estimatedSize = bfs::file_size(hashFileName);
 	}
-	std::istream& inputStream = *inputStreamPtr;
+	std::istream& hashStream = *hashStreamPtr;
 
-	secp256k1_start(SECP256K1_START_VERIFY | SECP256K1_START_SIGN);
+	std::ifstream keyFile;
+	std::istream* keyStreamPtr;
+	if (keyFileName == "-")
+	{
+		keyStreamPtr = &std::cin;
+	}
+	else
+	{
+		keyFile.open(keyFileName);
+		if (!keyFile.is_open())
+		{
+			std::cerr << "Error: Failed to open " << keyFileName << std::endl;
+			return 1;
+		}
+		keyStreamPtr = &keyFile;
+	}
+	std::istream& keyStream = *keyStreamPtr;
 
 	auto const estimatedHashCount = estimatedSize / 41;	// 34
 	AddressHashCollection addrs(estimatedHashCount);
 
 	std::istream_iterator<std::string> const end;
-	for (auto i = std::istream_iterator<std::string>(inputStream); i != end; ++i)
+	for (auto i = std::istream_iterator<std::string>(hashStream); i != end; ++i)
 	{
 		auto const& line = *i;
 		if (!line.empty() && !addrs.AddHash(line))
@@ -184,37 +208,71 @@ int main(int argc, char* argv[])
 
 	std::cout << "Loaded " << addrs.GetCount() << " address hashes" << std::endl;
 
-	struct tm timeinfo;
-	timeinfo.tm_year = 2010 - 1900;
-	timeinfo.tm_mon = 0;
-	timeinfo.tm_mday = 1;
-	timeinfo.tm_hour = 0;
-	timeinfo.tm_min = 0;
-	timeinfo.tm_sec = 0;
-	auto const minSeed = timegm(&timeinfo);
-
-	//timeinfo.tm_year = 2016;
-	timeinfo.tm_mday = 2;
-	auto const maxSeed = timegm(&timeinfo);
-
 	lock_type lock;
-	auto gen = std::unique_ptr<SecretGenerator>(new RandSecretGenerator(minSeed, maxSeed, 0, 10));
-	auto f = [&](bc::ec_secret& secret){
-			guard_type guard(lock);
-			secret = gen->Next();
-			return !gen->Done();
+	std::deque<bc::ec_secret> keys;
+	bool done = false;
+
+	auto loadKeys = [&] {
+			std::istream_iterator<std::string> const end;
+			bc::ec_secret secret;
+			for (auto i = std::istream_iterator<std::string>(keyStream); i != end && !done; ++i)
+			{
+				auto const& line = *i;
+				if (line.empty())
+				{
+					continue;
+				}
+				else if (!bc::decode_base16(secret, line))
+				{
+					std::cerr << "Bad hash ignored: " << line << std::endl;
+					continue;
+				}
+				auto size = 0ULL;
+				{
+					guard_type guard(lock);
+					keys.push_back(secret);
+					size = keys.size();
+				}
+				while (size > 50)
+				{
+					std::this_thread::yield();
+					guard_type guard(lock);
+					size = keys.size();
+				}
+			}
+			done = true;
 		};
+	auto getKey = [&](bc::ec_secret& secret) {
+			for (;; std::this_thread::yield()) {
+				guard_type guard(lock);
+				if (keys.empty())
+				{
+					if (done) {
+						return false;
+					}
+					continue;
+				}
+				secret = keys.front();
+				keys.pop_front();
+				return true;
+			}
+		};
+
+	std::thread loader(loadKeys);
 
 	std::vector<std::future<uint64_t>> results;
 	for (auto i : boost::counting_range(0U, threadCount))
 	{
-		results.push_back(std::async(std::launch::async, [&]{ return TimedCheck(f, addrs); }));
+		results.push_back(std::async(std::launch::async, [&]{ return TimedCheck(getKey, addrs); }));
 	}
 	for (auto& result : results)
 	{
 		auto count = result.get();
 		std::cerr << "Result: " << count << std::endl;
 	}
+
+	done = true;
+	loader.join();
 
 	return 0;
 }

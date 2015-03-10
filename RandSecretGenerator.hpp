@@ -11,7 +11,6 @@ class RandSecretGenerator
 private:
 	bc::ec_secret   _key;
 	uint32_t        _seed;
-	//uint32_t        _minSeed;
 	uint32_t        _maxSeed;
 	int             _minOffset;
 	int             _curOffset;
@@ -23,7 +22,6 @@ public:
 			uint32_t minSeed = 0, uint32_t maxSeed = 0,
 			int minOffset = 0, int maxOffset = 0)
 		: _seed      (minSeed)
-		//, _minSeed   (minSeed)
 		, _maxSeed   (maxSeed)
 		, _minOffset (minOffset)
 		, _curOffset (minOffset)
@@ -98,7 +96,7 @@ public:
 		{
 			return _seed == _maxSeed;
 		}
-		return _seed >= _maxSeed;
+		return _seed > _maxSeed;
 	}
 };
 
