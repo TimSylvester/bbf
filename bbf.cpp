@@ -1,4 +1,5 @@
 #include "AddressHashCollection.hpp"
+#include "concurrent_queue.hpp"
 
 #include <secp256k1.h>
 #include <bitcoin/bitcoin.hpp>
@@ -208,9 +209,8 @@ int main(int argc, char* argv[])
 
 	std::cout << "Loaded " << addrs.GetCount() << " address hashes" << std::endl;
 
-	lock_type lock;
-	std::deque<bc::ec_secret> keys;
-	bool done = false;
+	concurrent_queue<bc::ec_secret> queue(1000U);
+	std::atomic<bool> done(false);
 
 	auto loadKeys = [&] {
 			std::istream_iterator<std::string> const end;
@@ -218,44 +218,29 @@ int main(int argc, char* argv[])
 			for (auto i = std::istream_iterator<std::string>(keyStream); i != end && !done; ++i)
 			{
 				auto const& line = *i;
-				if (line.empty())
-				{
-					continue;
-				}
-				else if (!bc::decode_base16(secret, line))
+				if (!bc::decode_base16(secret, line))
 				{
 					std::cerr << "Bad hash ignored: " << line << std::endl;
 					continue;
 				}
-				auto size = 0ULL;
+				if (!queue.push(secret, std::chrono::seconds(30)))
 				{
-					guard_type guard(lock);
-					keys.push_back(secret);
-					size = keys.size();
-				}
-				while (size > 50)
-				{
-					std::this_thread::yield();
-					guard_type guard(lock);
-					size = keys.size();
+					std::cerr << "load failed" << std::endl;
+					break;
 				}
 			}
+			std::cerr << "load complete" << std::endl;
 			done = true;
 		};
 	auto getKey = [&](bc::ec_secret& secret) {
-			for (;; std::this_thread::yield()) {
-				guard_type guard(lock);
-				if (keys.empty())
-				{
-					if (done) {
-						return false;
-					}
-					continue;
+			while (!done) {
+				if (!queue.pop(secret, std::chrono::seconds(30))) {
+					std::cerr << "pop failed" << std::endl;
+					return false;
 				}
-				secret = keys.front();
-				keys.pop_front();
 				return true;
 			}
+			return false;
 		};
 
 	std::thread loader(loadKeys);
@@ -272,6 +257,7 @@ int main(int argc, char* argv[])
 	}
 
 	done = true;
+	queue.stop();
 	loader.join();
 
 	return 0;
