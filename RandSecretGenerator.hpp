@@ -1,9 +1,19 @@
 #ifndef RAND_SECRET_GENERATOR_HPP
 #define RAND_SECRET_GENERATOR_HPP
 
-#include "SecretGenerator.hpp"
+#include <bitcoin/bitcoin.hpp>
 #include <boost/date_time/posix_time/posix_time.hpp>
 #include <boost/format.hpp>
+
+class SecretGenerator
+{
+public:
+	SecretGenerator() {}
+	virtual ~SecretGenerator() {}
+	virtual bc::ec_secret const& Next() = 0;
+	virtual std::string Print() = 0;
+	virtual bool Done() = 0;
+};
 
 class RandSecretGenerator
 	: public SecretGenerator
