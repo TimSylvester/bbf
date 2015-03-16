@@ -68,7 +68,7 @@ uint64_t Check(GetSecretFn getSecret, AddressHashCollection const& addrs)
 		}
 		else
 		{
-			std::cerr << "secp256k1_ec_pubkey_create(C) failed (" << out_size << ")" << std::endl;
+			std::cerr << "ERROR: secp256k1_ec_pubkey_create(C) failed (" << out_size << ")" << std::endl;
 		}
 
 		if (secp256k1_ec_pubkey_create(uncompressed_pub_ecp.data(), &out_size, secret.data(), false) == 1 &&
@@ -84,7 +84,7 @@ uint64_t Check(GetSecretFn getSecret, AddressHashCollection const& addrs)
 		}
 		else
 		{
-			std::cerr << "secp256k1_ec_pubkey_create(U) failed (" << out_size << ")" << std::endl;
+			std::cerr << "ERROR: secp256k1_ec_pubkey_create(U) failed (" << out_size << ")" << std::endl;
 		}
 
 		if (match)
@@ -97,15 +97,44 @@ uint64_t Check(GetSecretFn getSecret, AddressHashCollection const& addrs)
 	return checked;
 }
 
-uint64_t TimedCheck(GetSecretFn getSecret, AddressHashCollection const& addrs)
+static bool ParseKey(bool base64, std::string const& line, bc::ec_secret& secret, bc::data_chunk& chunk)
 {
-	auto const t0 = std::chrono::steady_clock::now();
-	auto const checked = Check(getSecret, addrs);
-	auto const t1 = std::chrono::steady_clock::now();
-	auto const duration = std::chrono::duration_cast<std::chrono::duration<double> >(t1 - t0);
-	std::cerr << "Checked " << checked <<  " in " << duration.count() << "s ("
-		<< (checked / duration.count()) << "/s)" << std::endl;
-	return checked;
+	switch (line.size())
+	{
+		case 64:
+			return bc::decode_base16(secret, line);
+		case 40:
+			if (!bc::decode_base85(chunk, line))
+			{
+				return false;
+			}
+			break;
+		case 45:
+			if (base64)
+			{
+				if (!bc::decode_base64(chunk, line))
+				{
+					return false;
+				}
+			}
+			else if (!bc::decode_base58(chunk, line))
+			{
+				return false;
+			}
+			break;
+		default:
+			std::cerr<<line.size();
+			return false;
+	};
+
+
+	if (chunk.size() == secret.size())
+	{
+		std::copy(chunk.begin(), chunk.begin() + secret.size(), secret.begin());
+		return true;
+	}
+			std::cerr<<"2";
+	return false;
 }
 
 static unsigned DefaultThreadCount()
@@ -125,6 +154,7 @@ int main(int argc, char* argv[])
 	TCLAP::CmdLine cmd("BBF", ' ', "0.1");
 	TCLAP::UnlabeledValueArg<std::string> keyFileArg("keyfile",
 		"File containing base-16 keys", false, "-", "string", cmd);
+	TCLAP::SwitchArg base64KeysArg("", "base-64-keys", "Keys are in base-64 (else base-58)", cmd);
 	TCLAP::ValueArg<std::string> hashFileArg("a", "hashfile",
 		"File containing base-16 address hashes", true, std::string(), "string", cmd);
 	TCLAP::ValueArg<unsigned> threadCountArg("j", "threads",
@@ -135,17 +165,18 @@ int main(int argc, char* argv[])
 	}
 	catch (TCLAP::ArgException const& e)
 	{
-		std::cerr << "Error: " << e.error() << " for arg " << e.argId() << std::endl;
+		std::cerr << "ERROR: " << e.error() << " for arg " << e.argId() << std::endl;
 		return 1;
 	}
 
 	auto const& hashFileName = hashFileArg.getValue();
 	auto const& keyFileName = keyFileArg.getValue();
 	auto const threadCount = std::max(1U, std::min(MaxThreadCount(), threadCountArg.getValue()));
+	auto const base64 = base64KeysArg.getValue();
 
 	if (hashFileName == keyFileName)
 	{
-		std::cerr << "Error: Address hash and key sources match" << std::endl;
+		std::cerr << "ERROR: Address hash and key sources match" << std::endl;
 		return 1;
 	}
 
@@ -162,7 +193,7 @@ int main(int argc, char* argv[])
 		hashFile.open(hashFileName);
 		if (!hashFile.is_open())
 		{
-			std::cerr << "Error: Failed to open " << hashFileName << std::endl;
+			std::cerr << "ERROR: Failed to open " << hashFileName << std::endl;
 			return 1;
 		}
 		hashStreamPtr = &hashFile;
@@ -181,7 +212,7 @@ int main(int argc, char* argv[])
 		keyFile.open(keyFileName);
 		if (!keyFile.is_open())
 		{
-			std::cerr << "Error: Failed to open " << keyFileName << std::endl;
+			std::cerr << "ERROR: Failed to open " << keyFileName << std::endl;
 			return 1;
 		}
 		keyStreamPtr = &keyFile;
@@ -197,13 +228,13 @@ int main(int argc, char* argv[])
 		auto const& line = *i;
 		if (!line.empty() && !addrs.AddHash(line))
 		{
-			std::cerr << "Bad hash ignored: " << line << std::endl;
+			std::cerr << "ERROR: Bad hash: " << line << std::endl;
 		}
 	}
 
 	if (!addrs.Build())
 	{
-		std::cerr << "Failed to initialize address collection" << std::endl;
+		std::cerr << "ERROR: Failed to initialize address collection" << std::endl;
 		return 1;
 	}
 
@@ -212,53 +243,57 @@ int main(int argc, char* argv[])
 	concurrent_queue<bc::ec_secret> queue(1000U);
 	std::atomic<bool> done(false);
 
-	auto loadKeys = [&] {
-			std::istream_iterator<std::string> const end;
-			bc::ec_secret secret;
-			for (auto i = std::istream_iterator<std::string>(keyStream); i != end && !done; ++i)
-			{
-				auto const& line = *i;
-				if (!bc::decode_base16(secret, line))
-				{
-					std::cerr << "Bad hash ignored: " << line << std::endl;
-					continue;
-				}
-				if (!queue.push(secret, std::chrono::seconds(30)))
-				{
-					std::cerr << "load failed" << std::endl;
-					break;
-				}
-			}
-			std::cerr << "load complete" << std::endl;
-			done = true;
-		};
 	auto getKey = [&](bc::ec_secret& secret) {
-			while (!done) {
-				if (!queue.pop(secret, std::chrono::seconds(30))) {
-					std::cerr << "pop failed" << std::endl;
-					return false;
-				}
-				return true;
-			}
-			return false;
+			return queue.pop(secret, std::chrono::seconds(30));
 		};
-
-	std::thread loader(loadKeys);
 
 	std::vector<std::future<uint64_t>> results;
+	auto const t0 = std::chrono::steady_clock::now();
 	for (auto i : boost::counting_range(0U, threadCount))
 	{
-		results.push_back(std::async(std::launch::async, [&]{ return TimedCheck(getKey, addrs); }));
-	}
-	for (auto& result : results)
-	{
-		auto count = result.get();
-		std::cerr << "Result: " << count << std::endl;
+		results.push_back(std::async(std::launch::async,
+			[&]{ return Check(getKey, addrs); }));
 	}
 
+	bc::ec_secret secret;
+	bc::data_chunk chunk;
+	size_t loaded = 0;
+	for (auto i = std::istream_iterator<std::string>(keyStream); i != end && !done; ++i)
+	{
+		auto const& line = *i;
+		if (ParseKey(base64, line, secret, chunk))
+		{
+			if (queue.push(secret, std::chrono::seconds(30)))
+			{
+				++loaded;
+			}
+			else
+			{
+				std::cerr << "ERROR: Failed to add key" << std::endl;
+			}
+		}
+		else
+		{
+			std::cerr << "ERROR: Bad key: " << line << std::endl;
+		}
+	}
+	if (loaded)
+	{
+		std::cerr << "Loaded " << loaded << " keys" << std::endl;
+	}
 	done = true;
 	queue.stop();
-	loader.join();
+
+	size_t totalChecked = 0;
+	for (auto& result : results)
+	{
+		totalChecked += result.get();
+	}
+
+	auto const t1 = std::chrono::steady_clock::now();
+	auto const duration = std::chrono::duration_cast<std::chrono::duration<double>>(t1 - t0);
+	std::cerr << "Checked " << totalChecked <<  " in " << duration.count() << "s ("
+		<< (totalChecked / duration.count()) << "/s)" << std::endl;
 
 	return 0;
 }
